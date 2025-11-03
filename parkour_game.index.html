@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Parkour Peer Race</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load PeerJS for P2P multiplayer -->
+    <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+    <style>
+        /* Use Inter font */
+        body {
+            font-family: 'Inter', sans-serif;
+            overflow: hidden; /* Prevent scrolling */
+        }
+        /* Custom styles for the game */
+        #game-canvas {
+            display: block;
+            background: #000;
+            border-radius: 0.5rem;
+            border: 2px solid #4a5568;
+        }
+        /* Hide scrollbars */
+        ::-webkit-scrollbar {
+            display: none;
+        }
+        /* Ensure the lobby/game views take up the whole screen */
+        .view-container {
+            width: 100vw;
+            height: 100vh;
+        }
+        /* Simple modal for messages */
+        .custom-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+        }
+        .custom-modal.visible {
+            opacity: 1;
+            pointer-events: auto;
+        }
+        .modal-content {
+            background: white;
+            padding: 2rem;
+            border-radius: 0.5rem;
+            text-align: center;
+            color: #1a202c;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white flex items-center justify-center min-h-screen">
+
+    <!-- Lobby View -->
+    <div id="lobby-view" class="view-container flex flex-col items-center justify-center p-4">
+        <h1 class="text-5xl font-bold mb-6 text-blue-400">Parkour Peer Race</h1>
+        <div class="bg-gray-800 p-8 rounded-lg shadow-2xl w-full max-w-md">
+            
+            <div class="mb-4">
+                <label for="room-id-input" class="block text-sm font-medium text-gray-300 mb-2">Room ID:</label>
+                <input type="text" id="room-id-input" class="w-full p-3 bg-gray-700 rounded-lg border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Enter Room ID to join">
+            </div>
+
+            <div class="flex space-x-4">
+                <button id="host-game-btn" class="flex-1 bg-green-600 hover:bg-green-700 text-white font-bold p-3 rounded-lg shadow-lg transition duration-200">Host Game</button>
+                <button id="join-game-btn" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-bold p-3 rounded-lg shadow-lg transition duration-200">Join Game</button>
+            </div>
+            <p id="lobby-status" class="text-center text-yellow-400 mt-4 h-5"></p>
+        </div>
+        <p class="mt-4 text-gray-400 text-sm">Host a new game or enter a Room ID to join a friend.</p>
+    </div>
+
+    <!-- Game View -->
+    <div id="game-view" class="view-container flex-col items-center justify-center p-4 hidden">
+        <div class="w-full max-w-6xl flex justify-between items-center mb-2 px-2">
+            <div class="flex space-x-4">
+                <button id="leave-game-btn" class="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-lg shadow-md transition duration-200">&larr; Lobby</button>
+                <button id="reset-level-btn" class="bg-yellow-600 hover:bg-yellow-700 text-black font-bold py-2 px-4 rounded-lg shadow-md transition duration-200">Reset Level</button>
+            </div>
+            <div class="text-right">
+                <div id="level-display" class="text-3xl font-bold text-white">Level: 1</div>
+                <div id="room-id-display" classclass="text-sm text-gray-400">Room: ...</div>
+            </div>
+        </div>
+        <canvas id="game-canvas" width="1200" height="700"></canvas>
+    </div>
+
+    <!-- Custom Modal for Messages -->
+    <div id="message-modal" class="custom-modal">
+        <div class="modal-content">
+            <h2 id="modal-title" class="text-2xl font-bold mb-4">Message</h2>
+            <p id="modal-message" class="mb-6">This is a message.</p>
+            <button id="modal-close-btn" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-6 rounded-lg">OK</button>
+        </div>
+    </div>
+
+    <script type="module">
+        // --- Global Config & State ---
+        let peer; // Our PeerJS object
+        let myPeerId = null;
+        let connections = {}; // { peerId: dataConnection }
+        let isHost = false;
+        let gameLoopId = null;
+        let lastPositionSend = 0;
+        const POSITION_SEND_THROTTLE = 100; // ms
+
+        // Game Constants
+        const CANVAS_WIDTH = 1200;
+        const CANVAS_HEIGHT = 700;
+        const GRAVITY = 0.6;
+        const JUMP_FORCE = -13;
+        const MOVE_SPEED = 6;
+        const MAX_LEVELS = 50;
+
+        // Game State
+        const player = {
+            id: null, // Will be set to myPeerId
+            x: 100,
+            y: 500,
+            width: 20,
+            height: 40,
+            vx: 0,
+            vy: 0,
+            onGround: false,
+            color: randomColor(),
+            level: 1
+        };
+
+        let ghosts = {}; // { peerId: { x, y, level, color } }
+        let currentLevel = 1;
+        let platforms = [];
+        let endPortal = {};
+        const keys = {};
+
+        // DOM Elements
+        const lobbyView = document.getElementById('lobby-view');
+        const gameView = document.getElementById('game-view');
+        const canvas = document.getElementById('game-canvas');
+        const ctx = canvas.getContext('2d');
+        const levelDisplay = document.getElementById('level-display');
+        const roomIdDisplay = document.getElementById('room-id-display');
+        const roomIdInput = document.getElementById('room-id-input');
+        const hostGameBtn = document.getElementById('host-game-btn');
+        const joinGameBtn = document.getElementById('join-game-btn');
+        const leaveGameBtn = document.getElementById('leave-game-btn');
+        const resetLevelBtn = document.getElementById('reset-level-btn');
+        const lobbyStatus = document.getElementById('lobby-status');
+        
+        // Modal Elements
+        const messageModal = document.getElementById('message-modal');
+        const modalTitle = document.getElementById('modal-title');
+        const modalMessage = document.getElementById('modal-message');
+        const modalCloseBtn = document.getElementById('modal-close-btn');
+
+        // --- UI & Modal Functions ---
+
+        function showView(viewId) {
+            if (viewId === 'game') {
+                lobbyView.classList.add('hidden');
+                gameView.classList.remove('hidden');
+                gameView.classList.add('flex');
+            } else {
+                gameView.classList.add('hidden');
+                gameView.classList.remove('flex');
+                lobbyView.classList.remove('hidden');
+            }
+        }
+
+        function showMessage(title, message) {
+            modalTitle.textContent = title;
+            modalMessage.textContent = message;
+            messageModal.classList.add('visible');
+        }
+
+        function hideMessage() {
+            messageModal.classList.remove('visible');
+        }
+
+        // --- Networking (PeerJS) ---
+
+        function initializePeer() {
+            // Use PeerJS's public, free signaling server.
+            // No API key needed for basic use.
+            peer = new Peer(undefined, {
+                // debug: 2 // Uncomment for verbose console logs
+            });
+
+            peer.on('open', (id) => {
+                console.log('My PeerJS ID is:', id);
+                myPeerId = id;
+                player.id = id;
+                lobbyStatus.textContent = '';
+                hostGameBtn.disabled = false;
+                joinGameBtn.disabled = false;
+            });
+
+            // A: Host-side: When a client connects to us
+            peer.on('connection', (conn) => {
+                console.log('A client connected:', conn.peer);
+                setupConnection(conn);
+                
+                // Send the new client all current ghost data (except their own)
+                const otherGhosts = {...ghosts};
+                otherGhosts[player.id] = player; // Add host's data
+                delete otherGhosts[conn.peer]; // Don't send them their own data
+                
+                conn.send({ type: 'sync', ghosts: otherGhosts });
+            });
+
+            peer.on('disconnected', () => {
+                console.log('Peer disconnected. Reconnecting...');
+                peer.reconnect();
+            });
+
+            peer.on('close', () => {
+                console.log('Peer closed.');
+                leaveGame();
+            });
+
+            peer.on('error', (err) => {
+                console.error('PeerJS Error:', err);
+                if (err.type === 'peer-unavailable') {
+                    showMessage("Error", "Could not find a host with that ID. Please check the Room ID.");
+                    lobbyStatus.textContent = "Join failed.";
+                    hostGameBtn.disabled = false;
+                    joinGameBtn.disabled = false;
+                } else {
+                    showMessage("Connection Error", `An error occurred: ${err.message}`);
+                }
+            });
+        }
+
+        // B: Client-side: We connect to a host
+        function handleJoinGame() {
+            const hostId = roomIdInput.value.trim();
+            if (!hostId) {
+                showMessage("Error", "Please enter a Room ID.");
+                return;
+            }
+            if (!peer || !myPeerId) {
+                showMessage("Error", "Connecting to server... please wait a moment and try again.");
+                return;
+            }
+
+            console.log('Attempting to join host:', hostId);
+            lobbyStatus.textContent = "Joining...";
+            hostGameBtn.disabled = true;
+            joinGameBtn.disabled = true;
+
+            const conn = peer.connect(hostId, { reliable: true });
+            isHost = false;
+            setupConnection(conn);
+        }
+
+        function handleHostGame() {
+            if (!peer || !myPeerId) {
+                showMessage("Error", "Connecting to server... please wait a moment and try again.");
+                return;
+            }
+
+            console.log('Hosting game with ID:', myPeerId);
+            isHost = true;
+            
+            // Display the Room ID for sharing
+            roomIdInput.value = myPeerId;
+            roomIdDisplay.textContent = `Room: ${myPeerId}`;
+            showMessage("Game Hosted!", `Your Room ID is: ${myPeerId}\n\nSend this to your friend to join.`);
+            
+            startGame();
+        }
+
+        // C: Setup connection listeners (works for both host and client)
+        function setupConnection(conn) {
+            conn.on('open', () => {
+                console.log('Data connection open with:', conn.peer);
+                connections[conn.peer] = conn;
+
+                // If we are the client, joining was successful
+                if (!isHost) {
+                    lobbyStatus.textContent = "Joined!";
+                    roomIdDisplay.textContent = `Room: ${conn.peer}`;
+                    startGame();
+                }
+                
+                // Send our initial position
+                conn.send({ type: 'update', ...player });
+            });
+
+            conn.on('data', (data) => {
+                // console.log('Received data:', data);
+                handleNetworkData(data, conn.peer);
+            });
+
+            conn.on('close', () => {
+                console.log('Connection closed with:', conn.peer);
+                delete connections[conn.peer];
+                delete ghosts[conn.peer];
+            });
+
+            conn.on('error', (err) => {
+                console.warn('Connection error:', err);
+            });
+        }
+        
+        // D: Handle all incoming data
+        function handleNetworkData(data, peerId) {
+            switch(data.type) {
+                case 'update':
+                    // Update a ghost's position and level
+                    ghosts[peerId] = data;
+                    break;
+                case 'sync':
+                    // Client received a full sync from host
+                    ghosts = data.ghosts;
+                    break;
+            }
+        }
+        
+        // E: Broadcast our data to all connections
+        function broadcast(data) {
+            for (const peerId in connections) {
+                const conn = connections[peerId];
+                if (conn && conn.open) {
+                    conn.send(data);
+                }
+            }
+        }
+        
+        function sendPositionUpdate() {
+            const data = {
+                type: 'update',
+                id: player.id,
+                x: player.x,
+                y: player.y,
+                level: currentLevel,
+                color: player.color
+            };
+            
+            // As a client, just send to the host
+            if (!isHost) {
+                const hostConn = Object.values(connections)[0]; // Assume only one connection (to host)
+                if (hostConn && hostConn.open) {
+                    hostConn.send(data);
+                }
+            } else {
+                // As the host, update our own ghost record and broadcast to all clients
+                ghosts[player.id] = data; // Host keeps track of all ghosts
+                broadcast(data);
+            }
+        }
+        
+        function startGame() {
+            currentLevel = 1;
+            loadLevel(currentLevel);
+            showView('game');
+            gameLoop();
+        }
+
+        function leaveGame() {
+            // Stop game loop
+            if (gameLoopId) {
+                cancelAnimationFrame(gameLoopId);
+                gameLoopId = null;
+            }
+            
+            // Close all connections
+            for (const peerId in connections) {
+                connections[peerId].close();
+            }
+            connections = {};
+            ghosts = {};
+
+            // Destroy peer object
+            if (peer) {
+                peer.destroy();
+                peer = null;
+            }
+            
+            isHost = false;
+            showView('lobby');
+            lobbyStatus.textContent = "Connecting to server...";
+            hostGameBtn.disabled = true;
+            joinGameBtn.disabled = true;
+            initializePeer(); // Re-initialize for next game
+        }
+
+
+        // --- Level Generation ---
+
+        // Simple Pseudo-Random Number Generator (to make levels consistent)
+        function createPRNG(seed) {
+            let s = seed % 2147483647;
+            if (s <= 0) s += 2147483646;
+            return () => {
+                s = s * 16807 % 2147483647;
+                return (s - 1) / 2147483646;
+            };
+        }
+
+        function generateLevel(levelNum) {
+            const newPlatforms = [];
+            const rand = createPRNG(levelNum);
+            
+            let platformCount = 10 + Math.floor(levelNum * 1.5);
+            let lastX = 0;
+            let lastY = 550;
+
+            // Start platform
+            newPlatforms.push({ x: 50, y: 550, width: 200, height: 20 });
+
+            for (let i = 0; i < platformCount; i++) {
+                let x = lastX + 120 + rand() * 150;
+                let y = lastY + (rand() * 200 - 100); // +/- 100px vertically
+                
+                // Clamp Y
+                y = Math.max(150, Math.min(CANVAS_HEIGHT - 100, y));
+                let width = 80 + rand() * 100;
+                
+                newPlatforms.push({ x, y, width, height: 20 });
+                
+                lastX = x;
+                lastY = y;
+            }
+
+            // End portal
+            const portal = { x: lastX + 150, y: lastY - 100, width: 50, height: 100 };
+            
+            return { platforms: newPlatforms, endPortal: portal };
+        }
+
+        function loadLevel(levelNum) {
+            currentLevel = levelNum;
+            player.level = levelNum;
+            levelDisplay.textContent = `Level: ${currentLevel}`;
+            
+            if (currentLevel > MAX_LEVELS) {
+                showMessage("Congratulations!", "You have completed all 50 levels!");
+                loadLevel(1); // Restart
+                return;
+            }
+
+            const { platforms: newPlatforms, endPortal: newPortal } = generateLevel(currentLevel);
+            platforms = newPlatforms;
+            endPortal = newPortal;
+
+            // Reset player
+            player.x = 100;
+            player.y = 500;
+            player.vx = 0;
+            player.vy = 0;
+            player.onGround = false;
+
+            // Send level change
+            sendPositionUpdate();
+        }
+
+        function resetCurrentLevel() {
+            loadLevel(currentLevel);
+        }
+
+        // --- Game Loop ---
+
+        function gameLoop() {
+            update();
+            draw();
+            gameLoopId = requestAnimationFrame(gameLoop);
+        }
+
+        // --- Update Logic ---
+
+        function update() {
+            // Horizontal movement
+            player.vx = 0;
+            if (keys['a'] || keys['ArrowLeft']) {
+                player.vx = -MOVE_SPEED;
+            }
+            if (keys['d'] || keys['ArrowRight']) {
+                player.vx = MOVE_SPEED;
+            }
+            player.x += player.vx;
+
+            // Vertical movement (Gravity)
+            player.vy += GRAVITY;
+            player.y += player.vy;
+            player.onGround = false;
+
+            // Collision with platforms
+            for (const platform of platforms) {
+                if (rectIntersect(player, platform)) {
+                    // Check if player was above it in the previous frame
+                    if (player.y - player.vy + player.height <= platform.y) {
+                        player.y = platform.y - player.height;
+                        player.vy = 0;
+                        player.onGround = true;
+                    }
+                }
+            }
+            
+            // Jumping
+            if ((keys['w'] || keys['ArrowUp'] || keys[' ']) && player.onGround) {
+                player.vy = JUMP_FORCE;
+                player.onGround = false;
+            }
+
+            // Out of bounds (bottom)
+            if (player.y > CANVAS_HEIGHT + 200) {
+                resetCurrentLevel();
+            }
+
+            // Level complete
+            if (rectIntersect(player, endPortal)) {
+                loadLevel(currentLevel + 1);
+            }
+            
+            // Throttle position updates
+            const now = Date.now();
+            if (now - lastPositionSend > POSITION_SEND_THROTTLE) {
+                sendPositionUpdate();
+                lastPositionSend = now;
+            }
+        }
+
+        // --- Drawing Logic ---
+
+        function draw() {
+            // Clear canvas & set background color
+            ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+            
+            // Background color gets darker with levels
+            const lightness = Math.max(10, 30 - (currentLevel * 0.5));
+            const hue = (currentLevel * 15) % 360;
+            ctx.fillStyle = `hsl(${hue}, 50%, ${lightness}%)`;
+            ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+            // --- Camera (simple horizontal scroll) ---
+            ctx.save();
+            let camX = -player.x + CANVAS_WIDTH / 3;
+            camX = Math.min(0, camX); // Don't scroll past the left edge
+            ctx.translate(camX, 0);
+
+            // Draw platforms
+            ctx.fillStyle = "#374151"; // Gray-700
+            for (const platform of platforms) {
+                ctx.fillRect(platform.x, platform.y, platform.width, platform.height);
+            }
+
+            // Draw end portal
+            ctx.fillStyle = "gold";
+            ctx.fillRect(endPortal.x, endPortal.y, endPortal.width, endPortal.height);
+            ctx.fillStyle = "rgba(255, 255, 255, 0.3)";
+            ctx.fillRect(endPortal.x + 10, endPortal.y + 10, endPortal.width - 20, endPortal.height - 20);
+
+            // Draw ghosts
+            for (const id in ghosts) {
+                if (id === myPeerId) continue; // Don't draw ourself as a ghost
+                const ghost = ghosts[id];
+                if (ghost.level === currentLevel) {
+                    drawHumanoid(ghost.x, ghost.y, ghost.color, true);
+                }
+            }
+
+            // Draw player
+            drawHumanoid(player.x, player.y, player.color, false);
+            
+            ctx.restore();
+        }
+        
+        function drawHumanoid(x, y, color, isGhost) {
+            ctx.fillStyle = color;
+            ctx.globalAlpha = isGhost ? 0.4 : 1.0;
+            
+            const headY = y;
+            const bodyY = y + 12;
+            const legY = y + 30;
+
+            // Head
+            ctx.fillRect(x + 5, headY, 10, 10);
+            // Body
+            ctx.fillRect(x, bodyY, 20, 18);
+            // Legs
+            ctx.fillRect(x, legY, 8, 10);
+            ctx.fillRect(x + 12, legY, 8, 10);
+            
+            ctx.globalAlpha = 1.0;
+        }
+
+        // --- Utility Functions ---
+
+        function rectIntersect(r1, r2) {
+            return r1.x < r2.x + r2.width &&
+                   r1.x + r1.width > r2.x &&
+                   r1.y < r2.y + r2.height &&
+                   r1.y + r1.height > r2.y;
+        }
+        
+        function randomColor() {
+            return `hsl(${Math.random() * 360}, 100%, 70%)`;
+        }
+
+        // --- Event Listeners ---
+
+        window.addEventListener('keydown', (e) => {
+            keys[e.key] = true;
+        });
+
+        window.addEventListener('keyup', (e) => {
+            keys[e.key] = false;
+        });
+
+        hostGameBtn.addEventListener('click', handleHostGame);
+        joinGameBtn.addEventListener('click', handleJoinGame);
+        leaveGameBtn.addEventListener('click', leaveGame);
+        resetLevelBtn.addEventListener('click', resetCurrentLevel);
+        modalCloseBtn.addEventListener('click', hideMessage);
+
+        // --- Start ---
+        
+        // Wait for the full page (including the PeerJS script) to load
+        window.onload = () => {
+            lobbyStatus.textContent = "Connecting to server...";
+            hostGameBtn.disabled = true;
+            joinGameBtn.disabled = true;
+            initializePeer();
+        };
+
+    </script>
+</body>
+</html>
+
